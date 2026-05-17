@@ -6,7 +6,7 @@ python-dotenv==1.0.0
 
 # Database & Supabase
 supabase==1.0.3
-psycopg2-binary
+psycopg2-binary==2.9.12
 sqlalchemy==2.0.23
 asyncpg==0.29.0
 
@@ -50,7 +50,7 @@ loguru==0.7.2
 
 # File Processing
 pillow==10.1.0
-opencv-python-headless
+opencv-python-headless==4.8.1.78
 
 # Email & Notifications
 python-decouple==3.8

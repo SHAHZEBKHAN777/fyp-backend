@@ -1,408 +1,592 @@
+import os
 import json
-import re
-from typing import Dict, List, Any
-from datetime import datetime
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
+from typing import Dict, List, Any, Tuple
+import openai
 from sklearn.metrics.pairwise import cosine_similarity
+from dotenv import load_dotenv
+import logging
+
+load_dotenv()
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 class JobMatcher:
     def __init__(self):
-        self.skill_weight = 0.4
-        self.experience_weight = 0.3
-        self.education_weight = 0.15
-        self.location_weight = 0.1
-        self.salary_weight = 0.05
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.use_openai = bool(self.api_key)
         
-        # Predefined skill categories
-        self.skill_categories = {
-            'programming': ['python', 'java', 'javascript', 'c++', 'c#', 'php', 'ruby', 'go', 'swift', 'kotlin'],
-            'web': ['html', 'css', 'react', 'angular', 'vue', 'node.js', 'express', 'django', 'flask'],
-            'mobile': ['flutter', 'react native', 'android', 'ios', 'swift', 'kotlin', 'dart'],
-            'database': ['sql', 'mysql', 'postgresql', 'mongodb', 'redis', 'firebase'],
-            'devops': ['aws', 'azure', 'docker', 'kubernetes', 'jenkins', 'git', 'ci/cd'],
-            'data': ['machine learning', 'ai', 'data analysis', 'pandas', 'numpy', 'tensorflow'],
-            'soft_skills': ['communication', 'teamwork', 'leadership', 'problem solving', 'creativity']
+        if self.use_openai:
+            openai.api_key = self.api_key
+            logger.info("✅ OpenAI configured for job matching")
+        else:
+            logger.warning("⚠️  OPENAI_API_KEY not found, using basic matching")
+        
+        # Embedding cache to avoid repeated API calls
+        self.embedding_cache = {}
+        
+        # Skill weights for different job categories
+        self.skill_weights = {
+            "technical": 0.4,
+            "soft": 0.2,
+            "experience": 0.25,
+            "education": 0.15
         }
     
     def calculate_match_score(self, user_profile: Dict, job: Dict) -> Dict[str, Any]:
-        """Calculate comprehensive match score between user and job"""
+        """
+        Calculate comprehensive match score using AI embeddings + GPT reasoning
+        Returns detailed match analysis
+        """
         try:
-            # Calculate individual component scores
-            skill_score = self._calculate_skill_match(user_profile, job)
-            experience_score = self._calculate_experience_match(user_profile, job)
-            education_score = self._calculate_education_match(user_profile, job)
-            location_score = self._calculate_location_match(user_profile, job)
-            salary_score = self._calculate_salary_match(user_profile, job)
+            # Step 1: Prepare text for embedding
+            resume_text = self._prepare_resume_text(user_profile)
+            job_text = self._prepare_job_text(job)
             
-            # Calculate weighted total score
-            total_score = (
-                skill_score * self.skill_weight +
-                experience_score * self.experience_weight +
-                education_score * self.education_weight +
-                location_score * self.location_weight +
-                salary_score * self.salary_weight
+            # Step 2: Get embeddings and calculate semantic similarity
+            if self.use_openai:
+                resume_embedding = self._get_embedding(resume_text)
+                job_embedding = self._get_embedding(job_text)
+                similarity_score = self._calculate_similarity(resume_embedding, job_embedding)
+            else:
+                similarity_score = self._calculate_basic_match(user_profile, job)
+            
+            # Step 3: Get AI reasoning and decision
+            ai_result = self._get_ai_decision(user_profile, job, similarity_score)
+            
+            # Step 4: Calculate skill-specific matches
+            skill_match = self._calculate_skill_match(user_profile, job)
+            experience_match = self._calculate_experience_match(user_profile, job)
+            education_match = self._calculate_education_match(user_profile, job)
+            
+            # Step 5: Calculate weighted final score
+            final_score = (
+                similarity_score * 0.3 +
+                ai_result.get("score", similarity_score) * 0.3 +
+                skill_match * 0.2 +
+                experience_match * 0.15 +
+                education_match * 0.05
             )
             
-            # Generate insights
-            insights = self._generate_insights(
-                user_profile, job,
-                skill_score, experience_score, education_score,
-                location_score, salary_score
+            # Step 6: Generate insights
+            insights = self._generate_comprehensive_insights(
+                user_profile, job, final_score, skill_match, experience_match
+            )
+            
+            # Determine if should apply
+            should_apply = (
+                ai_result.get("decision") == "YES" and 
+                final_score >= 60
             )
             
             return {
-                "total_score": total_score,
+                "total_score": round(final_score, 1),
                 "breakdown": {
-                    "skills": skill_score,
-                    "experience": experience_score,
-                    "education": education_score,
-                    "location": location_score,
-                    "salary": salary_score
+                    "semantic_similarity": round(similarity_score, 1),
+                    "ai_reasoning_score": round(ai_result.get("score", 50), 1),
+                    "skill_match": round(skill_match, 1),
+                    "experience_match": round(experience_match, 1),
+                    "education_match": round(education_match, 1)
                 },
-                "weights": {
-                    "skills": self.skill_weight,
-                    "experience": self.experience_weight,
-                    "education": self.education_weight,
-                    "location": self.location_weight,
-                    "salary": self.salary_weight
-                },
+                "ai_decision": ai_result.get("decision", "MAYBE"),
+                "ai_reasoning": ai_result.get("reasoning", ""),
                 "insights": insights,
-                "match_level": self._get_match_level(total_score)
+                "match_level": self._get_match_level(final_score),
+                "should_apply": should_apply,
+                "confidence": ai_result.get("confidence", "medium")
             }
             
         except Exception as e:
-            print(f"Job matching error: {e}")
+            logger.error(f"❌ Job matching error: {e}")
             return self._get_fallback_match()
     
-    def _calculate_skill_match(self, user_profile: Dict, job: Dict) -> float:
-        """Calculate skill matching score"""
-        user_skills = self._extract_user_skills(user_profile)
+    def _prepare_resume_text(self, profile: Dict) -> str:
+        """Convert user profile to searchable text for embedding"""
+        parts = []
+        
+        # Name and title
+        name = profile.get("full_name") or f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
+        if name:
+            parts.append(f"Candidate: {name}")
+        
+        # Role
+        role = profile.get("role", "")
+        if role:
+            parts.append(f"Role: {role}")
+        
+        # Skills
+        skills = profile.get("skills", [])
+        if isinstance(skills, str):
+            skills = [s.strip() for s in skills.split(",")]
+        if skills:
+            parts.append(f"Skills: {', '.join(skills)}")
+        
+        # Experience
+        experience = profile.get("experience", [])
+        if experience and isinstance(experience, list):
+            exp_parts = []
+            for exp in experience[:3]:
+                if isinstance(exp, dict):
+                    title = exp.get("title", "")
+                    company = exp.get("company", "")
+                    desc = exp.get("description", "")
+                    if title:
+                        exp_parts.append(f"{title} at {company}: {desc[:100]}")
+            if exp_parts:
+                parts.append("Experience: " + "; ".join(exp_parts))
+        
+        # Years of experience
+        years = profile.get("experience_years", 0)
+        if years:
+            parts.append(f"Total Experience: {years} years")
+        
+        # Education
+        education = profile.get("education", [])
+        if education and isinstance(education, list):
+            edu_parts = []
+            for edu in education[:2]:
+                if isinstance(edu, dict):
+                    degree = edu.get("degree", "")
+                    institution = edu.get("institution", "")
+                    if degree:
+                        edu_parts.append(f"{degree} from {institution}")
+            if edu_parts:
+                parts.append("Education: " + "; ".join(edu_parts))
+        
+        # Summary
+        summary = profile.get("summary", "")
+        if summary:
+            parts.append(f"Summary: {summary[:200]}")
+        
+        # Location
+        location = profile.get("location", "")
+        if location:
+            parts.append(f"Location: {location}")
+        
+        return " | ".join(parts) if parts else "No profile data available"
+    
+    def _prepare_job_text(self, job: Dict) -> str:
+        """Convert job posting to searchable text for embedding"""
+        parts = []
+        
+        # Job title
+        title = job.get("job_title") or job.get("title", "")
+        if title:
+            parts.append(f"Position: {title}")
+        
+        # Company
+        company = job.get("companies", {})
+        if isinstance(company, dict):
+            company_name = company.get("companyname", "")
+        else:
+            company_name = job.get("company", "")
+        if company_name:
+            parts.append(f"Company: {company_name}")
+        
+        # Description
+        description = job.get("job_description") or job.get("description", "")
+        if description:
+            parts.append(f"Description: {description[:500]}")
+        
+        # Requirements
+        requirements = job.get("job_requirements") or job.get("requirements", "")
+        if requirements:
+            parts.append(f"Requirements: {requirements[:300]}")
+        
+        # Location
+        location = job.get("job_location") or job.get("location", "")
+        if location:
+            parts.append(f"Location: {location}")
+        
+        # Employment type
+        emp_type = job.get("employment_type") or job.get("job_type", "")
+        if emp_type:
+            parts.append(f"Type: {emp_type}")
+        
+        # Salary
+        salary = job.get("salary_range") or job.get("salary", "")
+        if salary:
+            parts.append(f"Salary: {salary}")
+        
+        return " | ".join(parts) if parts else "No job details available"
+    
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get OpenAI embedding for text"""
+        cache_key = hash(text[:200])
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+        
+        try:
+            if self.use_openai and text.strip():
+                response = openai.Embedding.create(
+                    model="text-embedding-ada-002",
+                    input=text[:8000]  # Limit length for API
+                )
+                embedding = response['data'][0]['embedding']
+                self.embedding_cache[cache_key] = embedding
+                return embedding
+        except Exception as e:
+            logger.error(f"Embedding error: {e}")
+        
+        # Fallback to random embedding
+        return np.random.randn(1536).tolist()
+    
+    def _calculate_similarity(self, emb1: List[float], emb2: List[float]) -> float:
+        """Calculate cosine similarity between embeddings"""
+        try:
+            emb1_np = np.array(emb1).reshape(1, -1)
+            emb2_np = np.array(emb2).reshape(1, -1)
+            similarity = cosine_similarity(emb1_np, emb2_np)[0][0]
+            return float(similarity * 100)
+        except:
+            return 50.0
+    
+    def _calculate_basic_match(self, user_profile: Dict, job: Dict) -> float:
+        """Basic skill-based matching without AI"""
+        user_skills = self._extract_skills(user_profile)
         job_skills = self._extract_job_skills(job)
         
         if not job_skills:
             return 50.0
         
-        # Calculate similarity
         matches = 0
         for job_skill in job_skills:
             job_skill_lower = job_skill.lower()
-            
-            # Check exact match
-            if any(job_skill_lower == user_skill.lower() for user_skill in user_skills):
-                matches += 1
-            # Check partial match
-            elif any(job_skill_lower in user_skill.lower() or 
-                    user_skill.lower() in job_skill_lower 
-                    for user_skill in user_skills):
-                matches += 0.7
-            # Check category match
-            elif self._check_skill_category(job_skill_lower, user_skills):
-                matches += 0.5
+            for user_skill in user_skills:
+                if job_skill_lower in user_skill.lower() or user_skill.lower() in job_skill_lower:
+                    matches += 1
+                    break
         
-        score = (matches / len(job_skills)) * 100
-        return min(max(score, 0), 100)
+        return (matches / len(job_skills)) * 100
     
-    def _extract_user_skills(self, user_profile: Dict) -> List[str]:
-        """Extract skills from user profile"""
-        skills = []
+    def _calculate_skill_match(self, user_profile: Dict, job: Dict) -> float:
+        """Calculate skill match percentage"""
+        user_skills = self._extract_skills(user_profile)
+        job_skills = self._extract_job_skills(job)
         
-        if user_profile.get('skills'):
-            if isinstance(user_profile['skills'], list):
-                skills.extend(user_profile['skills'])
-            elif isinstance(user_profile['skills'], str):
-                skills.extend([s.strip() for s in user_profile['skills'].split(',')])
+        if not job_skills:
+            return 50.0
         
-        # Extract from experience
-        if user_profile.get('experience'):
-            for exp in user_profile['experience']:
-                if isinstance(exp, dict) and exp.get('description'):
-                    desc = exp['description'].lower()
-                    # Look for common skills in description
-                    for category, cat_skills in self.skill_categories.items():
-                        for skill in cat_skills:
-                            if skill in desc and skill not in skills:
-                                skills.append(skill)
+        matched = 0
+        partial_matched = 0
         
-        # Add default skills if none
-        if not skills:
-            skills = ['problem solving', 'communication', 'teamwork']
-        
-        return [s.lower() for s in skills]
-    
-    def _extract_job_skills(self, job: Dict) -> List[str]:
-        """Extract required skills from job"""
-        skills = []
-        
-        # From description
-        if job.get('description'):
-            desc = job['description'].lower()
+        for job_skill in job_skills:
+            job_skill_lower = job_skill.lower()
+            found_exact = False
+            found_partial = False
             
-            # Look for skills in common categories
-            for category, cat_skills in self.skill_categories.items():
-                for skill in cat_skills:
-                    if skill in desc and skill not in skills:
-                        skills.append(skill)
+            for user_skill in user_skills:
+                user_skill_lower = user_skill.lower()
+                
+                # Exact match
+                if job_skill_lower == user_skill_lower:
+                    found_exact = True
+                    break
+                
+                # Partial match
+                if job_skill_lower in user_skill_lower or user_skill_lower in job_skill_lower:
+                    found_partial = True
             
-            # Extract from requirements section
-            requirement_sections = ['requirements:', 'qualifications:', 'must have:']
-            for section in requirement_sections:
-                if section in desc:
-                    start = desc.find(section) + len(section)
-                    end = desc.find('\n', start)
-                    if end == -1:
-                        end = start + 200
-                    
-                    req_text = desc[start:end]
-                    # Simple extraction of capitalized words (potential skills)
-                    words = re.findall(r'\b[A-Z][a-z]+\b', job['description'])
-                    for word in words:
-                        if len(word) > 3 and word.lower() not in skills:
-                            for cat_skills in self.skill_categories.values():
-                                if word.lower() in cat_skills:
-                                    skills.append(word.lower())
-                                    break
+            if found_exact:
+                matched += 1
+            elif found_partial:
+                partial_matched += 0.5
         
-        # From title
-        if job.get('title'):
-            title = job['title'].lower()
-            for cat_skills in self.skill_categories.values():
-                for skill in cat_skills:
-                    if skill in title and skill not in skills:
-                        skills.append(skill)
-        
-        return list(set(skills))[:15]
-    
-    def _check_skill_category(self, job_skill: str, user_skills: List[str]) -> bool:
-        """Check if user has skills in same category"""
-        # Find category of job skill
-        job_category = None
-        for category, skills in self.skill_categories.items():
-            if job_skill in skills:
-                job_category = category
-                break
-        
-        if not job_category:
-            return False
-        
-        # Check if user has any skill in same category
-        for user_skill in user_skills:
-            if user_skill in self.skill_categories.get(job_category, []):
-                return True
-        
-        return False
+        total_match = matched + partial_matched
+        return (total_match / len(job_skills)) * 100
     
     def _calculate_experience_match(self, user_profile: Dict, job: Dict) -> float:
-        """Calculate experience matching score"""
-        user_exp = user_profile.get('experience_years', 0)
+        """Calculate experience level match"""
+        user_years = user_profile.get("experience_years", 0)
         
         # Try to extract required experience from job
-        job_exp_required = 0
-        if job.get('description'):
-            desc = job['description'].lower()
-            
-            # Look for experience patterns
-            exp_patterns = [
-                r'(\d+)\+?\s*years?',
-                r'(\d+)\+?\s*yrs?',
-                r'experience.*?(\d+).*?years?',
-                r'(\d+).*?years?.*?experience'
-            ]
-            
-            for pattern in exp_patterns:
-                match = re.search(pattern, desc)
-                if match:
-                    try:
-                        job_exp_required = int(match.group(1))
-                        break
-                    except:
-                        continue
+        job_years = self._extract_required_experience(job)
         
-        if job_exp_required == 0:
-            return 75.0  # Default score if no experience requirement
+        if job_years == 0:
+            return 75.0  # No experience requirement specified
         
-        if user_exp >= job_exp_required:
-            return 100.0
-        elif user_exp > 0:
-            # Proportional score
-            score = (user_exp / job_exp_required) * 100
-            return min(score, 100)
+        if user_years >= job_years:
+            # Extra points for more experience (up to 100)
+            return min(100, 80 + (user_years - job_years) * 5)
         else:
-            return 30.0
+            # Penalty for less experience
+            ratio = user_years / job_years
+            return ratio * 60  # Max 60 if doesn't meet requirement
     
     def _calculate_education_match(self, user_profile: Dict, job: Dict) -> float:
-        """Calculate education matching score"""
-        user_education = user_profile.get('education', [])
-        
+        """Calculate education level match"""
+        user_education = user_profile.get("education", [])
         if not user_education:
             return 50.0
         
-        # Check for degree requirements
-        if job.get('description'):
-            desc = job['description'].lower()
-            
-            degree_keywords = [
-                'bachelor', "bachelor's", 'bs', 'bsc', 'ba',
-                'master', "master's", 'ms', 'msc', 'ma',
-                'phd', 'doctorate', 'mba'
-            ]
-            
-            # Check if any degree is mentioned in job description
-            for keyword in degree_keywords:
-                if keyword in desc:
-                    # Check if user has similar education
-                    for edu in user_education:
-                        if isinstance(edu, dict):
-                            degree = edu.get('degree', '').lower()
-                            if keyword in degree:
-                                return 100.0
-            
-            # No specific degree requirement found
-            return 80.0
+        # Check if user has relevant education
+        job_description = job.get("job_description", "").lower()
         
-        return 70.0
+        education_keywords = ["bachelor", "master", "phd", "degree", "computer science", 
+                             "engineering", "information technology"]
+        
+        has_relevant = False
+        for edu in user_education:
+            if isinstance(edu, dict):
+                degree = edu.get("degree", "").lower()
+                for keyword in education_keywords:
+                    if keyword in degree or keyword in job_description:
+                        has_relevant = True
+                        break
+        
+        return 85.0 if has_relevant else 60.0
     
-    def _calculate_location_match(self, user_profile: Dict, job: Dict) -> float:
-        """Calculate location matching score"""
-        user_location = user_profile.get('location', '').lower()
-        job_location = job.get('location', '').lower()
+    def _get_ai_decision(self, user_profile: Dict, job: Dict, similarity: float) -> Dict:
+        """Use GPT to make final decision with detailed reasoning"""
+        try:
+            if not self.use_openai:
+                return self._get_fallback_decision(similarity)
+            
+            # Prepare data
+            user_name = user_profile.get("full_name") or "Candidate"
+            skills = self._extract_skills(user_profile)
+            experience = user_profile.get("experience_years", 0)
+            summary = user_profile.get("summary", "")[:200]
+            
+            job_title = job.get("job_title") or job.get("title", "Position")
+            job_desc = job.get("job_description") or job.get("description", "")
+            job_reqs = job.get("job_requirements") or ""
+            
+            prompt = f"""You are an expert recruitment AI. Analyze this candidate-job match and provide a detailed assessment.
+
+CANDIDATE PROFILE:
+- Name: {user_name}
+- Skills: {', '.join(skills[:15])}
+- Experience: {experience} years
+- Summary: {summary}
+
+JOB DETAILS:
+- Title: {job_title}
+- Description: {job_desc[:500]}
+- Requirements: {job_reqs[:300]}
+
+Semantic Similarity Score: {similarity:.1f}%
+
+Please analyze and return ONLY a valid JSON object with these exact fields:
+{{
+    "skill_match": number (0-100),
+    "experience_match": number (0-100),
+    "overall_score": number (0-100),
+    "decision": "YES" or "NO" or "MAYBE",
+    "confidence": "high" or "medium" or "low",
+    "reasoning": "Detailed 2-3 sentence explanation of your decision",
+    "key_strengths": ["strength1", "strength2"],
+    "key_gaps": ["gap1", "gap2"],
+    "recommendation": "Specific advice for the candidate"
+}}
+
+JSON:"""
+
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert AI recruitment assistant. Be honest, accurate, and helpful."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500,
+                timeout=15
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Extract JSON
+            json_start = result_text.find('{')
+            json_end = result_text.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                result = json.loads(result_text[json_start:json_end])
+                
+                return {
+                    "skill_match": float(result.get("skill_match", 50)),
+                    "experience_match": float(result.get("experience_match", 50)),
+                    "score": float(result.get("overall_score", similarity)),
+                    "decision": result.get("decision", "MAYBE"),
+                    "confidence": result.get("confidence", "medium"),
+                    "reasoning": result.get("reasoning", "Analysis based on AI evaluation"),
+                    "key_strengths": result.get("key_strengths", []),
+                    "key_gaps": result.get("key_gaps", []),
+                    "recommendation": result.get("recommendation", "")
+                }
+            
+        except Exception as e:
+            logger.error(f"AI decision error: {e}")
         
-        if not user_location or not job_location:
-            return 50.0
-        
-        # Check for remote work
-        if 'remote' in job_location or 'anywhere' in job_location:
-            return 100.0
-        
-        # Check exact match
-        if user_location == job_location:
-            return 100.0
-        
-        # Check partial match (city, country)
-        user_parts = set(user_location.split())
-        job_parts = set(job_location.split())
-        
-        if user_parts.intersection(job_parts):
-            return 80.0
-        
-        return 30.0
+        return self._get_fallback_decision(similarity)
     
-    def _calculate_salary_match(self, user_profile: Dict, job: Dict) -> float:
-        """Calculate salary matching score"""
-        user_expected = user_profile.get('expected_salary', 0)
-        job_min = job.get('salary_min', 0)
-        job_max = job.get('salary_max', 0)
-        
-        if user_expected <= 0 or job_max <= 0:
-            return 50.0
-        
-        if job_min <= user_expected <= job_max:
-            return 100.0
-        elif user_expected < job_min:
-            # User expects less than minimum - good for employer
-            return 90.0
+    def _get_fallback_decision(self, similarity: float) -> Dict:
+        """Fallback decision based on similarity score"""
+        if similarity >= 75:
+            decision = "YES"
+            confidence = "high"
+        elif similarity >= 60:
+            decision = "YES"
+            confidence = "medium"
+        elif similarity >= 45:
+            decision = "MAYBE"
+            confidence = "low"
         else:
-            # User expects more than maximum
-            ratio = job_max / user_expected
-            return max(30.0, ratio * 100)
+            decision = "NO"
+            confidence = "high"
+        
+        return {
+            "skill_match": similarity,
+            "experience_match": similarity,
+            "score": similarity,
+            "decision": decision,
+            "confidence": confidence,
+            "reasoning": f"Based on {similarity:.0f}% semantic similarity",
+            "key_strengths": [],
+            "key_gaps": [],
+            "recommendation": "Review job requirements carefully"
+        }
     
-    def _generate_insights(self, user_profile: Dict, job: Dict,
-                          skill_score: float, exp_score: float,
-                          edu_score: float, loc_score: float,
-                          salary_score: float) -> List[str]:
-        """Generate insights based on match scores"""
+    def _generate_comprehensive_insights(self, user_profile: Dict, job: Dict, 
+                                        final_score: float, skill_match: float,
+                                        experience_match: float) -> List[str]:
+        """Generate actionable insights for the user"""
         insights = []
         
-        job_title = job.get('title', 'this position')
+        job_title = job.get("job_title") or "this position"
         
         # Overall match insight
-        total_score = (
-            skill_score * self.skill_weight +
-            exp_score * self.experience_weight +
-            edu_score * self.education_weight +
-            loc_score * self.location_weight +
-            salary_score * self.salary_weight
-        )
-        
-        if total_score >= 80:
-            insights.append(f"Excellent match for {job_title}! You meet most requirements.")
-        elif total_score >= 60:
-            insights.append(f"Good match for {job_title}. Consider applying.")
+        if final_score >= 80:
+            insights.append(f"🌟 Excellent match for {job_title}! Your profile aligns very well.")
+        elif final_score >= 65:
+            insights.append(f"👍 Good match for {job_title}. You're a strong candidate.")
+        elif final_score >= 50:
+            insights.append(f"📊 Moderate match for {job_title}. Consider highlighting relevant experience.")
         else:
-            insights.append(f"Limited match for {job_title}. Consider other opportunities.")
+            insights.append(f"⚠️ Below average match for {job_title}. Review requirements carefully.")
         
         # Skill insights
-        if skill_score < 60:
-            job_skills = self._extract_job_skills(job)
-            insights.append(f"Add these skills to improve match: {', '.join(job_skills[:3])}")
+        if skill_match < 60:
+            missing_skills = self._identify_missing_skills(user_profile, job)
+            if missing_skills:
+                insights.append(f"📚 Consider developing: {', '.join(missing_skills[:3])}")
+        else:
+            insights.append("✅ Your skills align well with the job requirements.")
         
         # Experience insights
-        user_exp = user_profile.get('experience_years', 0)
-        if exp_score < 70 and user_exp < 2:
-            insights.append("Highlight projects and achievements to compensate for experience.")
-        
-        # Location insights
-        if loc_score < 50:
-            insights.append("Consider remote opportunities or relocation.")
-        
-        # Salary insights
-        user_expected = user_profile.get('expected_salary', 0)
-        job_max = job.get('salary_max', 0)
-        if salary_score < 50 and user_expected > job_max > 0:
-            insights.append(f"Expected salary (${user_expected:,}) exceeds range (up to ${job_max:,})")
+        if experience_match < 60:
+            insights.append("⏳ Experience level is below requirements. Highlight relevant projects.")
+        else:
+            insights.append("💼 Your experience level matches the position well.")
         
         return insights[:5]
     
+    def _extract_skills(self, profile: Dict) -> List[str]:
+        """Extract skills from user profile"""
+        skills = []
+        
+        if profile.get("skills"):
+            if isinstance(profile["skills"], list):
+                skills = profile["skills"]
+            elif isinstance(profile["skills"], str):
+                skills = [s.strip() for s in profile["skills"].split(",")]
+        
+        if not skills:
+            skills = ["Communication", "Problem Solving", "Teamwork"]
+        
+        return list(set(skills))
+    
+    def _extract_job_skills(self, job: Dict) -> List[str]:
+        """Extract required skills from job posting"""
+        skills = []
+        
+        # Check requirements field
+        requirements = job.get("job_requirements") or job.get("requirements", "")
+        if isinstance(requirements, str):
+            # Extract skills from requirements text
+            common_skills = [
+                "Python", "Java", "JavaScript", "React", "Angular", "Vue", 
+                "Node.js", "Flutter", "Dart", "Swift", "Kotlin", "SQL",
+                "Docker", "Kubernetes", "AWS", "Azure", "Git", "REST API",
+                "GraphQL", "Machine Learning", "AI", "Data Analysis"
+            ]
+            for skill in common_skills:
+                if skill.lower() in requirements.lower():
+                    skills.append(skill)
+        
+        # Also check description
+        description = job.get("job_description") or job.get("description", "")
+        if isinstance(description, str):
+            for skill in common_skills:
+                if skill.lower() in description.lower() and skill not in skills:
+                    skills.append(skill)
+        
+        if not skills:
+            skills = ["Relevant technical skills"]
+        
+        return list(set(skills))
+    
+    def _extract_required_experience(self, job: Dict) -> int:
+        """Extract required years of experience from job posting"""
+        import re
+        
+        text = f"{job.get('job_description', '')} {job.get('job_requirements', '')}"
+        
+        # Look for patterns like "X+ years", "X years experience"
+        patterns = [
+            r'(\d+)\+?\s*(?:years|yrs)(?:\s*of)?\s*experience',
+            r'experience\s*(?:of\s*)?(\d+)\+?\s*(?:years|yrs)',
+            r'(\d+)\s*-\s*\d+\s*(?:years|yrs)'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text.lower())
+            if matches:
+                return int(matches[0])
+        
+        return 0
+    
+    def _identify_missing_skills(self, user_profile: Dict, job: Dict) -> List[str]:
+        """Identify skills missing from user profile"""
+        user_skills = [s.lower() for s in self._extract_skills(user_profile)]
+        job_skills = self._extract_job_skills(job)
+        
+        missing = []
+        for skill in job_skills:
+            skill_lower = skill.lower()
+            if not any(skill_lower in us or us in skill_lower for us in user_skills):
+                missing.append(skill)
+        
+        return missing[:5]
+    
     def _get_match_level(self, score: float) -> str:
-        """Get match level description"""
-        if score >= 90:
-            return "Perfect Match"
-        elif score >= 75:
+        """Get descriptive match level"""
+        if score >= 85:
+            return "Excellent Match"
+        elif score >= 70:
             return "Strong Match"
-        elif score >= 60:
+        elif score >= 55:
             return "Good Match"
         elif score >= 40:
             return "Fair Match"
         else:
             return "Weak Match"
     
-    def get_recommended_jobs(self, user_id: str, limit: int = 10) -> List[Dict]:
-        """Get AI-recommended jobs for user"""
-        # This would typically query database
-        # For now, return sample structure
-        return [
-            {
-                "job_id": "1",
-                "title": "Senior Flutter Developer",
-                "company": "Tech Corp",
-                "match_score": 92,
-                "reason": "Matches your Flutter and mobile development skills",
-                "salary_range": "$80,000 - $120,000",
-                "location": "Remote"
-            },
-            {
-                "job_id": "2",
-                "title": "Mobile App Developer",
-                "company": "Startup XYZ",
-                "match_score": 85,
-                "reason": "Strong alignment with your experience",
-                "salary_range": "$70,000 - $100,000",
-                "location": "New York"
-            }
-        ]
-    
     def _get_fallback_match(self) -> Dict[str, Any]:
-        """Fallback match result"""
+        """Ultimate fallback match result"""
         return {
-            "total_score": 50,
+            "total_score": 50.0,
             "breakdown": {
-                "skills": 50,
-                "experience": 50,
-                "education": 50,
-                "location": 50,
-                "salary": 50
+                "semantic_similarity": 50.0,
+                "ai_reasoning_score": 50.0,
+                "skill_match": 50.0,
+                "experience_match": 50.0,
+                "education_match": 50.0
             },
-            "weights": self.__dict__.get('weights', {}),
-            "insights": ["Unable to calculate detailed match score"],
-            "match_level": "Unknown"
+            "ai_decision": "MAYBE",
+            "ai_reasoning": "Unable to perform detailed analysis. Using default score.",
+            "insights": ["Complete your profile for better matching", "Add more skills to improve matches"],
+            "match_level": "Unknown",
+            "should_apply": False,
+            "confidence": "low"
         }

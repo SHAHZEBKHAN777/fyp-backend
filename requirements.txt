@@ -6,7 +6,7 @@ python-dotenv==1.0.0
 
 # Database & Supabase
 supabase==1.0.3
-psycopg2-binary==2.9.12
+psycopg2-binary==2.9.9
 sqlalchemy==2.0.23
 asyncpg==0.29.0
 
